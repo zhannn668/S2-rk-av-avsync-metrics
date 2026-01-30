@@ -1,0 +1,121 @@
+diff --git a/src/avsync.h b/src/avsync.h
+index 0000000..0000000 100644
+--- a/src/avsync.h
++++ b/src/avsync.h
+@@ -1,18 +1,51 @@
+ // src/avsync.h
+ #pragma once
+ 
+ #include <stdint.h>
++#include <pthread.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+ 
+-typedef struct AvSync AvSync;
++typedef struct AvSync {
++    pthread_mutex_t mu;
++
++    // config
++    uint64_t expected_video_delta_us;
++
++    // first pts for locking offset
++    int has_video0;
++    int has_audio0;
++    uint64_t video0_us;
++    uint64_t audio0_us;
++
++    int offset_locked;
++    int64_t offset_us; // audio0 - video0
++
++    // last pts (for offset calc)
++    int has_last_video;
++    int has_last_audio;
++    uint64_t last_video_us;
++    uint64_t last_audio_us;
++
++    // jitter sampling (per 1s bucket)
++    double vj_ms[128];
++    int vj_n;
++    double aj_ms[256];
++    int aj_n;
++
++    // for jitter expected (audio uses previous chunk length)
++    uint32_t last_audio_frames;
++    uint32_t last_audio_sr;
++    int has_last_audio_meta;
++
++    // drift baseline
++    int drift_base_set;
++    uint64_t drift_t0_us;
++    double residual0_ms;
++} AvSync;
+ 
+ /*
+  * 初始化 AvSync 模块。
+  *
+  * @param s        AvSync 实例
+  * @param video_fps 视频帧率（用于计算 video expected delta）
+  */
+ int avsync_init(AvSync *s, int video_fps);
+ 
+ /* 释放资源（主要是 mutex） */
+ void avsync_deinit(AvSync *s);
+ 
+ void avsync_on_video(AvSync *s, uint64_t video_pts_us);
+ void avsync_on_audio(AvSync *s, uint64_t audio_pts_us, uint32_t frames, uint32_t sample_rate);
+ void avsync_report_1s(AvSync *s, uint64_t now_us);
+ 
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/src/avsync.c b/src/avsync.c
+index 0000000..0000000 100644
+--- a/src/avsync.c
++++ b/src/avsync.c
+@@ -13,44 +13,6 @@
+ #define MAX_VJ  128   // 30fps -> <=30/s
+ #define MAX_AJ  256   // 48k/1024 -> ~46/s
+ 
+-struct AvSync {
+-    pthread_mutex_t mu;
+-
+-    // config
+-    uint64_t expected_video_delta_us;
+-
+-    // first pts for locking offset
+-    int has_video0;
+-    int has_audio0;
+-    uint64_t video0_us;
+-    uint64_t audio0_us;
+-
+-    int offset_locked;
+-    int64_t offset_us; // audio0 - video0
+-
+-    // last pts (for offset calc)
+-    int has_last_video;
+-    int has_last_audio;
+-    uint64_t last_video_us;
+-    uint64_t last_audio_us;
+-
+-    // jitter sampling (per 1s bucket)
+-    double vj_ms[MAX_VJ];
+-    int vj_n;
+-    double aj_ms[MAX_AJ];
+-    int aj_n;
+-
+-    // for jitter expected (audio uses previous chunk length)
+-    uint32_t last_audio_frames;
+-    uint32_t last_audio_sr;
+-    int has_last_audio_meta;
+-
+-    // drift baseline
+-    int drift_base_set;
+-    uint64_t drift_t0_us;
+-    double residual0_ms;
+-};
+-
+ static inline double us_to_ms(double us) { return us / 1000.0; }
+ 
+ static inline double dabs(double x) { return x < 0.0 ? -x : x; }
