@@ -276,40 +276,71 @@ undefined reference to `avsync_deinit'
 
 ---
 
-### 9.5 aligned_residual_ms 一直稳定在 -67ms（不是 drift，而是“常量偏置”）
+### 9.3 Bug：av_offset_ms 只在第 1 秒有值，之后全是 n/a
 **现象**：
-- `aligned_residual_ms` 长期稳定在某个固定负值（例如 **-67ms**）
-- `drift_msps ≈ 0`（或非常接近 0）
-- jitter 指标正常，运行很久也不“线性跑飞”
+- 程序启动后第 1 次 `avsync_report_1s()` 能打印 `av_offset_ms`
+- 从第 2 秒开始 `av_offset_ms=n/a`（或不再更新）
 
-**结论**：
-- 这通常不是同步“越来越差”的 drift，而是 **启动对齐（offset lock）阶段引入的固定偏置**。
-- 换句话说：系统处于“稳定同步”，但你的 **零点定义** 让 residual 的中心不在 0，而在 -67ms。
+**根因（常见实现错误）**：
+- `av_offset_ms` 的计算依赖“本秒内是否收集到了有效配对样本”，但样本收集逻辑只在“首次 lock offset”时做了一次，后续没有在 `avsync_on_video()` / `avsync_on_audio()` 持续更新可用于 report 的配对数据。
+- 另一种常见情况：report 线程每秒会把 `has_video/has_audio/has_pair` 之类的标志清零，但数据面线程没有再把它置回（或者 report 与数据面竞争导致状态丢失）。
 
-**最常见原因（按概率排序）**：
-1) **offset 锁定时音频/视频不是同一“体验点”采样**
-   - 例如 audio0 取自“采集/解码时刻”，video0 取自“编码完成/入队时刻”
-   - 两条链路固有 pipeline latency 不同，残差会表现为稳定常量偏移
+**修复方式（推荐口径：视频事件配对）**：
+- 在 **每次收到视频帧**（`avsync_on_video()`）时，用“最近一次音频时间戳 `last_audio_pts`”做配对，得到当下的：
+  - `off_ms = (video_pts - last_audio_pts)/1000`
+  - `res_ms = ((video_pts + offset_us) - last_audio_pts)/1000`
+- 把 `off_ms/res_ms` 作为“本秒样本”写入数组/环形缓冲，并更新 `last_off_ms` / `last_res_ms`。
+- `avsync_report_1s()` 只负责从“本秒样本集合”取 p50/p95（或至少取最后一次样本），不要依赖“仅初始化时算过一次”的值。
 
-2) **video_pts 与 audio_pts 的时钟域/生成口径不一致**
-   - 音频 pts 用 samples 推进（稳定），视频 pts 用 monotonic 时间戳（受采样点影响）
-   - 二者虽然都“单调”，但零点和生成时刻不同，会出现固定差
+**验证方法**：
+- 连续跑 10 秒，确保每一秒 report 都有 `av_offset_ms=...`（不再出现 n/a）
+- 若某秒视频确实没到（例如卡顿），允许该秒为 n/a，但下一秒恢复后应继续有值。
 
-3) **首次锁定 offset 的配对策略不合理**
-   - “首次同时拿到”并不等于“同一时刻”
-   - 如果 audio 先来多个 chunk 再来第 1 帧视频，你锁到的 offset 本身就带相位差
 
-**建议修复/改进（按侵入性从小到大）**：
-- **改 offset 锁定口径为“视频事件配对”**（推荐与第 8.2 一致）：
-  - 在收到第一帧视频时，用“当时最近的 last_audio_pts”来锁 offset
-  - 或收集前 N 帧视频的 residual，取 p50 作为 offset（更稳）
-- **明确 residual 的语义**：它到底要表达“对齐到播放体验点的差”，还是“PTS 时钟轴差”。
-  - 若要贴近体验点：应在 sink/输出点取样并锁定 offset
-- **把这个常量偏置当作“baseline”展示**：
-  - 报告中同时打印 `baseline_ms`（offset 锁定时的 residual p50）
-  - 之后展示 `residual_delta_ms = residual_ms - baseline_ms`
-  - 这样更容易观察“是否跑飞”，也能避免固定 -67ms 造成误解
+---
 
+### 9.4 Bug：a_jitter_ms 始终是 p50=0.000 p95=0.000
+**现象**：
+- 日志长期打印 `a_jitter_ms p50=0.000 p95=0.000`
+- 即使系统负载变化也几乎不动
+
+**先说明：这“可能正常”，也可能是统计没喂到数据**
+- **可能正常**：如果你的 `audio_pts` 是严格按 `samples_count` 推进（而不是用 `clock_gettime()` 采样），并且每次读取的 `period_frames` 恒定（例如 1024），那么“PTS 间隔”是理论固定值，按 PTS 算出来的 jitter 会非常接近 0。
+- **可能是 bug**（更常见于早期版本）：音频 jitter 统计用的是“系统时间到达间隔”或“队列消费间隔”，但代码实际上拿到的是“理论 pts”，导致 jitter 永远被算成 0；或者根本没有把音频间隔样本写入统计容器（样本数一直为 0，p50/p95 退化成 0）。
+
+**修复/改进建议（把口径写清楚，避免误解）**：
+1) 在 README/日志中明确 **a_jitter 的口径**：
+   - **PTS-jitter（推荐作为时钟稳定性）**：用 `audio_pts` 的相邻差值与理论间隔比（通常≈0，属于正常现象）
+   - **arrival-jitter（推荐作为调度抖动）**：用“音频块到达/消费时刻的 monotonic 时间差”与理论间隔比（能反映调度与线程抖动）
+2) 如果你希望 a_jitter 能反映系统负载波动：
+   - 在 `avsync_on_audio()` 里同时记录 `now_us = monotonic_us()`（到达/消费时刻）
+   - 计算 `arrival_interval_us = now_us - last_audio_arrival_us`
+   - 再算 `jitter = |arrival_interval - expected_interval|`
+   - report 时输出 `a_arrival_jitter_ms p50/p95`（与 `a_pts_jitter_ms` 分开打印，避免混淆）
+
+**验证方法**：
+- 在板端制造负载（例如同时跑编码/压力测试），`a_arrival_jitter_ms p95` 应该上升；`a_pts_jitter_ms` 仍接近 0 也属正常。
+- 若两个都恒为 0，需要检查：样本数是否为 0、expected_interval 是否算错（例如单位错误 us/ms）、last_ts 是否从未更新。
+
+
+---
+
+### 9.5 aligned_residual_ms 一直稳定在 -67ms（常量偏置）
+**现象**：
+- `aligned_residual_ms` 长期稳定在 -67ms 左右
+- `drift_msps` 接近 0，不呈线性跑飞
+
+**原因**：
+- 这通常不是 drift，而是 **offset 锁定的采样点/链路延迟差** 导致的“固定基线偏移”（pipeline latency baseline）。
+- 例如：音频 pts 的取样点与视频 pts 的取样点不在同一“体验点”（sink/写文件/编码后），会引入固定差值。
+
+**处理建议**：
+- 把 -67ms 当作 baseline：报告中额外输出 `baseline_ms`，并提供 `residual_delta_ms = residual_ms - baseline_ms` 用于判断“是否跑飞”。
+- 或改 offset 锁定策略：用“视频事件配对”的 residual p50（前 N 帧/前 1 秒）来锁 offset，使 residual 的中心更接近 0。
+
+**验证方法**：
+- baseline 存在但 drift≈0：判定“稳定同步（但有固定延迟差）”
+- residual_delta_ms 长期不单边增长：判定不跑飞
 ---
 
 ## 10. 验收标准（S2）
