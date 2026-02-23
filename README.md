@@ -232,11 +232,21 @@ src/main.c:24:15: 错误： ‘g_avsync’的存储大小未知
 static AvSync g_avsync;
 ```
 
-**原因**：`avsync.h` 只有前向声明 `typedef struct AvSync AvSync;`，结构体不完整，无法在 main.c 里定义实体。
+**原因**：`avsync.h` 只有前向声明 `typedef struct AvSync AvSync;`，结构体不完整（incomplete type），因此不能在 `main.c` 里定义实体对象（只能声明指针）。
 
-**解决方案**（二选一）：
-1) **推荐**：把 `struct AvSync { ... }` 的完整定义放进 `avsync.h`
-2) 或者改 main.c 使用 `AvSync*` 指针并提供 create/destroy（改动更大）
+**修复方式（推荐）**：
+- **把 `struct AvSync { ... }` 的完整定义放进 `avsync.h`**（让 `main.c` 能看到完整类型）
+- 保留 `avsync.c` 里对内部字段的实现，但注意避免在头文件中暴露不必要的内部依赖（可通过把“仅内部使用的成员”拆到子结构体或用注释标注私有字段）
+
+**替代方式（不推荐，改动更大）**：
+- `main.c` 改为只持有 `AvSync*`：
+  - 提供 `avsync_create()/avsync_destroy()` 或 `avsync_init()/avsync_deinit()` 内部 malloc/free
+  - 需要梳理生命周期与线程安全，工程改动更大
+
+**避免复发建议**：
+- 只要上层需要 `static AvSync g_avsync;` 或栈上 `AvSync av;`，头文件就必须提供完整结构体定义。
+- 如果希望“隐藏实现”，那就必须统一走指针 + create/destroy 的 API 风格（不能两头都要）。
+
 
 ---
 
@@ -250,43 +260,55 @@ undefined reference to `avsync_init'
 undefined reference to `avsync_deinit'
 ```
 
-**原因**：链接时没有把 `src/avsync.c` 编进目标（Makefile SRCS/OBJS 缺失）。
+**原因**：链接阶段找不到符号实现。最常见情况是 **`src/avsync.c` 没有被编译/链接进最终目标**（Makefile 的 SRCS/OBJS 缺失或目标规则未覆盖）。
 
-**解决方案**：
-- Makefile 的 SRCS 列表里加入：
+**修复方式**：
+- 确认 Makefile 中 `SRCS`（或等价变量）包含：
   - `src/avsync.c`
-- 或 OBJS 列表里加入：
+- 或确认 `OBJS` 包含：
   - `src/avsync.o`
+- 若使用通配符（如 `$(wildcard src/*.c)`），确认 `avsync.c` 的路径与命名匹配规则。
+
+**快速自检**：
+- `make V=1`（或等价 verbose）观察最终链接命令里是否出现 `avsync.o`
+- `nm -C <your_binary> | grep avsync_` 确认符号是否被链接进可执行文件
+
 
 ---
 
-### 9.3 git apply 补丁损坏
-**报错**：
-```
-error: 补丁在第 XX 行损坏
-```
-
-**原因**：终端复制粘贴 patch 时，出现丢行、重复行、`+/-` 破坏、缩进错位等。
-
-**解决方案**：
-- 不建议手敲 patch  
-- 优先用“按文件修改”的方式：
-  - 直接 `vi src/avsync.h / src/avsync.c / Makefile` 修改
-
----
-
-### 9.4 drift 输出看起来异常大（例如 -4ms/s）
+### 9.5 aligned_residual_ms 一直稳定在 -67ms（不是 drift，而是“常量偏置”）
 **现象**：
-- `aligned_residual_ms` 每秒持续变负
-- `drift_msps` 约 -4ms/s
-- 但音频 jitter p50/p95 显示 0（音频 PTS 很稳定）
+- `aligned_residual_ms` 长期稳定在某个固定负值（例如 **-67ms**）
+- `drift_msps ≈ 0`（或非常接近 0）
+- jitter 指标正常，运行很久也不“线性跑飞”
 
-**原因**（高概率）：
-- drift 统计口径使用了 `last_video_pts` 与 `last_audio_pts` 的“秒表抽样”，受音频更新频率更高影响产生相位偏差（measurement artifact）
+**结论**：
+- 这通常不是同步“越来越差”的 drift，而是 **启动对齐（offset lock）阶段引入的固定偏置**。
+- 换句话说：系统处于“稳定同步”，但你的 **零点定义** 让 residual 的中心不在 0，而在 -67ms。
 
-**解决方案**：
-- 改为“视频事件配对”的 residual 样本收集（见第 8.2 节）
-- 每秒用 residual 样本的 p50 计算 drift
+**最常见原因（按概率排序）**：
+1) **offset 锁定时音频/视频不是同一“体验点”采样**
+   - 例如 audio0 取自“采集/解码时刻”，video0 取自“编码完成/入队时刻”
+   - 两条链路固有 pipeline latency 不同，残差会表现为稳定常量偏移
+
+2) **video_pts 与 audio_pts 的时钟域/生成口径不一致**
+   - 音频 pts 用 samples 推进（稳定），视频 pts 用 monotonic 时间戳（受采样点影响）
+   - 二者虽然都“单调”，但零点和生成时刻不同，会出现固定差
+
+3) **首次锁定 offset 的配对策略不合理**
+   - “首次同时拿到”并不等于“同一时刻”
+   - 如果 audio 先来多个 chunk 再来第 1 帧视频，你锁到的 offset 本身就带相位差
+
+**建议修复/改进（按侵入性从小到大）**：
+- **改 offset 锁定口径为“视频事件配对”**（推荐与第 8.2 一致）：
+  - 在收到第一帧视频时，用“当时最近的 last_audio_pts”来锁 offset
+  - 或收集前 N 帧视频的 residual，取 p50 作为 offset（更稳）
+- **明确 residual 的语义**：它到底要表达“对齐到播放体验点的差”，还是“PTS 时钟轴差”。
+  - 若要贴近体验点：应在 sink/输出点取样并锁定 offset
+- **把这个常量偏置当作“baseline”展示**：
+  - 报告中同时打印 `baseline_ms`（offset 锁定时的 residual p50）
+  - 之后展示 `residual_delta_ms = residual_ms - baseline_ms`
+  - 这样更容易观察“是否跑飞”，也能避免固定 -67ms 造成误解
 
 ---
 
